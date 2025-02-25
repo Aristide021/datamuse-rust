@@ -1,6 +1,7 @@
 use reqwest::Client;
 use crate::utils::build_query_string;
 use crate::models::WordElement;
+use crate::error::DatamuseError;
 
 #[derive(Debug, Clone)]
 pub struct WordsEndpoint {
@@ -21,6 +22,8 @@ pub struct WordsEndpoint {
     rel_bgb: Option<String>,
     rel_hom: Option<String>,
     rel_cns: Option<String>,
+    rel_rhy: Option<String>,
+    rel_nry: Option<String>,
     lc: Option<String>,
     rc: Option<String>,
     md: Option<String>,
@@ -48,6 +51,8 @@ impl WordsEndpoint {
             rel_bgb: None,
             rel_hom: None,
             rel_cns: None,
+            rel_rhy: None,
+            rel_nry: None,
             lc: None,
             rc: None,
             md: None,
@@ -74,6 +79,18 @@ impl WordsEndpoint {
         new_endpoint
     }
 
+    pub fn starts_with(&self, letter: &str) -> Self {
+        let safe_letter = urlencoding::encode(letter);
+        let pattern = format!("{}*", safe_letter);
+        self.spelled_like(&pattern)
+    }
+
+    pub fn ends_with(&self, letter: &str) -> Self {
+        let safe_letter = urlencoding::encode(letter);
+        let pattern = format!("*{}", safe_letter);
+        self.spelled_like(&pattern)
+    }
+
     pub fn related_synonyms(&self, term: &str) -> Self {
         let mut new_endpoint = self.clone();
         new_endpoint.rel_syn = Some(term.to_string());
@@ -89,6 +106,18 @@ impl WordsEndpoint {
     pub fn related_antonyms(&self, term: &str) -> Self {
         let mut new_endpoint = self.clone();
         new_endpoint.rel_ant = Some(term.to_string());
+        new_endpoint
+    }
+
+    pub fn related_rhymes(&self, term: &str) -> Self {
+        let mut new_endpoint = self.clone();
+        new_endpoint.rel_rhy = Some(term.to_string());
+        new_endpoint
+    }
+
+    pub fn related_near_rhymes(&self, term: &str) -> Self {
+        let mut new_endpoint = self.clone();
+        new_endpoint.rel_nry = Some(term.to_string());
         new_endpoint
     }
 
@@ -164,9 +193,9 @@ impl WordsEndpoint {
         new_endpoint
     }
 
-    pub fn meta_data(&self, term: &str) -> Self {
+    pub fn meta_data(&self, flags: &str) -> Self {
         let mut new_endpoint = self.clone();
-        new_endpoint.md = Some(term.to_string());
+        new_endpoint.md = Some(flags.to_string());
         new_endpoint
     }
 
@@ -182,7 +211,7 @@ impl WordsEndpoint {
         new_endpoint
     }
 
-    pub async fn call(&self) -> Result<Vec<WordElement>, Box<dyn std::error::Error>> {
+    pub async fn call(&self) -> Result<Vec<WordElement>, DatamuseError> {
         let mut params: Vec<(&str, String)> = Vec::new();
         if let Some(ml) = &self.ml {
             params.push(("ml", ml.clone()));
@@ -232,6 +261,12 @@ impl WordsEndpoint {
         if let Some(rel_cns) = &self.rel_cns {
             params.push(("rel_cns", rel_cns.clone()));
         }
+        if let Some(rel_rhy) = &self.rel_rhy {
+            params.push(("rel_rhy", rel_rhy.clone()));
+        }
+        if let Some(rel_nry) = &self.rel_nry {
+            params.push(("rel_nry", rel_nry.clone()));
+        }
         if let Some(lc) = &self.lc {
             params.push(("lc", lc.clone()));
         }
@@ -251,8 +286,32 @@ impl WordsEndpoint {
         let query_string = build_query_string(&params);
         let url = format!("https://api.datamuse.com/words?{}", query_string);
 
-        let response = self.client.get(&url).send().await?;
-        let word_list: Vec<WordElement> = response.json().await?;
+        let response = self.client.get(&url).send().await.map_err(DatamuseError::NetworkError)?;
+        
+        if !response.status().is_success() {
+            return Err(DatamuseError::ApiError(format!(
+                "API request failed with status: {}",
+                response.status()
+            )));
+        }
+
+        let response_text = response.text().await.map_err(DatamuseError::NetworkError)?;
+        let mut word_list: Vec<WordElement> = serde_json::from_str(&response_text)
+            .map_err(|e| DatamuseError::ParsingError(format!("Failed to parse JSON: {}", e)))?;
+
+        // Process frequency data from tags
+        for word in &mut word_list {
+            if let Some(tags) = &word.tags {
+                for tag in tags {
+                    if tag.starts_with("f:") {
+                        if let Ok(freq) = tag[2..].parse::<f64>() {
+                            word.frequency = Some(freq);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(word_list)
     }
